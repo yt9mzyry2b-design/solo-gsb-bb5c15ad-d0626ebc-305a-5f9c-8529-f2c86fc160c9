@@ -39,12 +39,30 @@ app = FastAPI(
 # --- request / response schemas (OpenAPI) -----------------------------------
 
 
+class AnchorItem(BaseModel):
+    reference_index: int = Field(
+        ..., ge=0, description="0-based index of the locked reference event"
+    )
+    target_index: int = Field(
+        ..., ge=0, description="0-based index of the locked target event"
+    )
+
+
 class AlignRequest(BaseModel):
     reference: Any = Field(
         ..., description="Reference log: JSON array of events or JSONL string"
     )
     target: Any = Field(
         ..., description="Log to calibrate: JSON array of events or JSONL string"
+    )
+    anchors: Optional[list[AnchorItem]] = Field(
+        default=None,
+        description=(
+            "Manual (non-skippable) anchor locks as "
+            "{reference_index, target_index} pairs. The order-preserving "
+            "matcher runs independently inside each gap between locks and "
+            "may neither reuse a locked event nor cross an anchor."
+        ),
     )
     time_field: Optional[str] = Field(
         default=None,
@@ -69,12 +87,14 @@ def _to_config(
     label_field: Optional[str],
     iterations: int,
     time_weight: float,
+    anchors: Any = None,
 ) -> AlignConfig:
     return AlignConfig(
         time_field=time_field or None,
         label_field=label_field or None,
         iterations=iterations,
         time_weight=time_weight,
+        manual_anchors=anchors,
     )
 
 
@@ -108,6 +128,7 @@ async def align(request: Request) -> JSONResponse:
                 body.get("label_field"),
                 int(body.get("iterations", 3)),
                 float(body.get("time_weight", 0.5)),
+                body.get("anchors"),
             )
             reference, target = body["reference"], body["target"]
 
@@ -126,6 +147,9 @@ async def align(request: Request) -> JSONResponse:
                 form.get("label_field"),
                 int(form.get("iterations", 3)),
                 float(form.get("time_weight", 0.5)),
+                # JSON string, e.g.
+                # -F 'anchors=[{"reference_index":0,"target_index":0}]'
+                form.get("anchors"),
             )
         else:
             raise HTTPException(

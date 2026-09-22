@@ -97,12 +97,68 @@ curl -s http://localhost:8000/align \
   -F "iterations=3" | python -m json.tool
 ```
 
+### 人工锚点(anchors)
+
+可选字段 `anchors` 是一组**人工锁定的匹配对**,每项形如
+`{"reference_index": i, "target_index": j}`(索引均为 0 基,即事件在各自
+输入数组/JSONL 中的行号)。人工锚点是**不可跳过**的匹配:算法先按锚点把
+两侧序列切成相邻区间(首锚点之前、相邻锚点之间、末锚点之后),在每个区间内
+**独立执行原有的保序带权匹配**,再合并全部锚点统一拟合分段线性时钟映射。
+自动匹配因此:
+
+* 不会占用任何已锁定事件(锁定事件不出现在候选窗口中);
+* 不会跨越人工锚点(每个区间的候选对严格夹在两侧锚点之间)。
+
+人工锚点在响应中标记 `"source": "manual"`(置信度固定为 `1.0`),自动匹配
+标记 `"source": "auto"`;`summary.manual_anchor_count` 返回人工锚点数。
+
+**JSON 请求示例**:
+
+```bash
+curl -s http://localhost:8000/align \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "reference": [
+          {"timestamp": 1790000000.0, "label": "LINE_START"},
+          {"timestamp": 1790000030.0, "label": "HEATER_ON"},
+          {"timestamp": 1790000060.0, "label": "TEMP_RAMP"}
+        ],
+        "target": [
+          {"timestamp": 1790000005.6, "label": "LINE_START"},
+          {"timestamp": 1790000036.2, "label": "HEATER_ON"},
+          {"timestamp": 1790000067.4, "label": "TEMP_RAMP"}
+        ],
+        "anchors": [
+          {"reference_index": 0, "target_index": 0},
+          {"reference_index": 2, "target_index": 2}
+        ]
+      }'
+```
+
+**multipart 请求示例**(锚点通过同名表单字段以 JSON 文本提交):
+
+```bash
+curl -s http://localhost:8000/align \
+  -F "reference=@examples/reference.jsonl;type=application/x-ndjson" \
+  -F "target=@examples/target.jsonl;type=application/x-ndjson" \
+  -F 'anchors=[{"reference_index":0,"target_index":0},{"reference_index":30,"target_index":30}]' \
+  | python -m json.tool
+```
+
+以下情况返回 **400**,错误信息以 `anchors[k]` 等形式给出可定位原因:
+
+* 索引越界(`reference_index` / `target_index` 超出各自事件数,或为负);
+* 重复占用(同一参考或待校准事件被多个锚点锁定);
+* 标签不一致(锚定的两个事件 `label` 不同);
+* 次序交叉(按参考索引排序后,待校准索引不是严格递增——保序匹配无法同时满足)。
+
 #### 请求参数
 
 | 字段          | 类型            | 默认 | 说明                                              |
 | ------------- | --------------- | ---- | ------------------------------------------------- |
 | `reference`   | 数组或 JSONL 串 | 必填 | 参考日志                                          |
 | `target`      | 数组或 JSONL 串 | 必填 | 待校准日志                                        |
+| `anchors`     | 锚点对象数组    | 无   | 人工锚点,每项 `{reference_index, target_index}`;multipart 下以 JSON 文本字段提交 |
 | `time_field`  | string          | 自动 | 时间戳字段名;缺省依次探测 `timestamp/time/ts/datetime/date` |
 | `label_field` | string          | 自动 | 标签字段名;缺省依次探测 `label/tag/event/type/name`        |
 | `iterations`  | int 1–10        | 3    | 匹配/拟合精化轮数                                 |
@@ -118,7 +174,9 @@ curl -s http://localhost:8000/align \
   "summary": {
     "reference_count": 60,
     "target_count": 61,
-    "matched_count": 59,        // 锚点数
+    "matched_count": 59,        // 锚点数(人工 + 自动)
+    "manual_anchor_count": 2,   // 人工锁定锚点数
+    "auto_anchor_count": 57,    // 自动匹配锚点数
     "inserted_count": 2,        // 待校准侧多余(插入)事件
     "missing_count": 1,         // 参考侧缺失事件
     "mean_confidence": 0.82,    // 锚点平均置信度 [0,1]
@@ -146,11 +204,13 @@ curl -s http://localhost:8000/align \
     ]
   },
   "anchors": [ { "reference_index": 0, "target_index": 0, "label": "...",
+                 "source": "manual",                  // manual = 人工锁定,auto = 自动匹配
                  "reference_time": ..., "target_time": ...,
-                 "mapped_time": ..., "residual": 0.0, "confidence": 0.98 } ],
+                 "mapped_time": ..., "residual": 0.0, "confidence": 1.0 } ],
   "aligned_events": [
     // 待校准侧每条记录;status = matched | inserted
-    { "index": 0, "status": "matched", "label": "LINE_START",
+    // matched 时 source = manual | auto,inserted 时为 null
+    { "index": 0, "status": "matched", "label": "LINE_START", "source": "manual",
       "original_time": 1790000005.014,
       "original_time_iso": "2026-09-22T...Z",
       "calibrated_time": 1790000000.0,
@@ -192,6 +252,12 @@ curl -s http://localhost:8000/align \
   最近同标签事件(抗插入/缺失)与按顺序位置配对(抗大速率漂移),选用偏移自洽性
   (MAD 最小)的一组拟合全局最小二乘直线;随后多轮"匹配 → 分段拟合 → 用锚点留一
   法残差收紧 σ",默认 3 轮收敛。
+* **人工锚点**:给定人工锚点时,序列被锚点切成若干半开区间(首锚点之前、相邻
+  锚点之间、末锚点之后),原保序匹配在每个区间内独立运行——候选对的两侧索引都
+  被严格限制在区间内,故自动匹配既不能复用已锁事件,也不能跨过锚点;两个及以上
+  锚点时直接以穿过全部锚点的全局最小二乘直线作为各区间的初始映射。所有人工锚点
+  与区间自动锚点合并后统一拟合分段线性映射;人工锚点置信度固定为 1.0,自动锚点
+  的置信度只由自动锚点的留一法残差尺度归一化,避免人工锁定被时钟跳变相邻段压低。
 * **置信度**:对每个锚点计算其由相邻锚点局部直线预测的留一法残差,以全体残差的
   P90 为尺度做高斯衰减;时钟断点附近残差大、置信度低,其余锚点接近 1。
 
@@ -204,4 +270,6 @@ python -m pytest -q
 
 覆盖:已知分段漂移恢复、纯速率漂移、重复同标签保序匹配、标签全无交集、单锚点、
 外推标记、JSONL 文本输入、字段缺失报错以及 `/health`、`/align` 的
-JSON / multipart / 400 / 415 路径。
+JSON / multipart / 400 / 415 路径;人工锚点覆盖区间切分不跨锚、锁定事件不被
+自动匹配占用、单锚点/全锚点、JSON 与 multipart 两种提交,以及索引越界、重复
+占用、标签不一致、次序交叉、非法 JSON 的 400 定位报错。

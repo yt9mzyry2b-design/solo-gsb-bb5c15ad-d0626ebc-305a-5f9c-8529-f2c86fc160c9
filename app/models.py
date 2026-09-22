@@ -23,3 +23,4 @@ class Anchor:
     ref: Event
     tgt: Event
     confidence: float
+    source: str = "auto"   # "manual" (client-locked) or "auto" (DP match)

@@ -27,6 +27,9 @@ class AlignConfig:
     label_field: str | None = None
     iterations: int = 3
     time_weight: float = 0.5
+    # Raw client-supplied anchors: {"reference_index": int,
+    # "target_index": int}; validated after both streams are parsed.
+    manual_anchors: Any = None
 
 
 # --- parsing ----------------------------------------------------------------
@@ -100,6 +103,124 @@ def parse_events(raw: Any, cfg: AlignConfig) -> list[Event]:
     return events
 
 
+# --- manual anchors ---------------------------------------------------------
+
+
+def _coerce_manual_anchors(raw: Any) -> list[dict[str, Any]]:
+    """Normalise the ``anchors`` request field to a list of objects.
+
+    A JSON array is accepted directly; a string is parsed as JSON (this is
+    how multipart form fields always arrive).
+    """
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return []
+        try:
+            raw = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise InputError(f"anchors: invalid JSON: {exc}") from exc
+        except TypeError as exc:
+            raise InputError(
+                "anchors must be a JSON text field, not a file upload"
+            ) from exc
+    if isinstance(raw, dict):
+        raw = [raw]
+    if not isinstance(raw, list):
+        raise InputError("anchors must be an array of anchor objects")
+    return raw
+
+
+def resolve_manual_pairs(
+    refs: Sequence[Event],
+    tgts: Sequence[Event],
+    raw: Any,
+) -> list[tuple[Event, Event]]:
+    """Validate client anchors and resolve indices to event pairs.
+
+    Error messages pinpoint the offending anchor (its position in the
+    request and/or indices) so callers can locate the cause.
+    """
+    entries = _coerce_manual_anchors(raw)
+    if not entries:
+        return []
+
+    ref_by_seq = {e.seq: e for e in refs}
+    tgt_by_seq = {e.seq: e for e in tgts}
+
+    pairs: list[tuple[Event, Event]] = []
+    used_refs: set[int] = set()
+    used_tgts: set[int] = set()
+
+    for n, item in enumerate(entries):
+        where = f"anchors[{n}]"
+        if not isinstance(item, dict):
+            raise InputError(f"{where}: anchor must be an object")
+        if "reference_index" not in item or "target_index" not in item:
+            raise InputError(
+                f"{where}: requires 'reference_index' and 'target_index'"
+            )
+        ri, ti = item["reference_index"], item["target_index"]
+        if isinstance(ri, bool) or not isinstance(ri, int):
+            raise InputError(
+                f"{where}: reference_index must be an integer, got "
+                f"{type(ri).__name__}"
+            )
+        if isinstance(ti, bool) or not isinstance(ti, int):
+            raise InputError(
+                f"{where}: target_index must be an integer, got "
+                f"{type(ti).__name__}"
+            )
+        if ri < 0 or ri >= len(refs):
+            raise InputError(
+                f"{where}: reference_index {ri} out of range "
+                f"(reference has {len(refs)} events, valid 0.."
+                f"{len(refs) - 1})"
+            )
+        if ti < 0 or ti >= len(tgts):
+            raise InputError(
+                f"{where}: target_index {ti} out of range "
+                f"(target has {len(tgts)} events, valid 0..{len(tgts) - 1})"
+            )
+        if ri in used_refs:
+            raise InputError(
+                f"{where}: reference_index {ri} is already locked by an "
+                f"earlier anchor (duplicate occupation)"
+            )
+        if ti in used_tgts:
+            raise InputError(
+                f"{where}: target_index {ti} is already locked by an "
+                f"earlier anchor (duplicate occupation)"
+            )
+        r_ev, t_ev = ref_by_seq[ri], tgt_by_seq[ti]
+        if r_ev.label != t_ev.label:
+            raise InputError(
+                f"{where}: label mismatch -- reference_index {ri} has label "
+                f"{r_ev.label!r} but target_index {ti} has label "
+                f"{t_ev.label!r}"
+            )
+        used_refs.add(ri)
+        used_tgts.add(ti)
+        pairs.append((r_ev, t_ev))
+
+    # Ordering: when sorted by reference index the target indices must be
+    # strictly increasing.  Any inversion would force the order-preserving
+    # matcher to cross a locked pair.
+    ordered = sorted(pairs, key=lambda p: p[0].seq)
+    for (r1, t1), (r2, t2) in zip(ordered, ordered[1:]):
+        if t2.seq <= t1.seq:
+            raise InputError(
+                "anchors cross: (reference_index="
+                f"{r1.seq}, target_index={t1.seq}) and "
+                f"(reference_index={r2.seq}, target_index={t2.seq}) are "
+                "inconsistent with the strict ordering of both sides"
+            )
+
+    return ordered
+
+
 # --- result assembly --------------------------------------------------------
 
 
@@ -136,8 +257,11 @@ def run_alignment(refs_raw: Any, tgts_raw: Any,
     if not refs and not tgts:
         raise InputError("both reference and target streams are empty")
 
+    manual_pairs = resolve_manual_pairs(refs, tgts, cfg.manual_anchors)
+
     anchors, mapping, residual_scale = align_sequences(
-        refs, tgts, iterations=cfg.iterations, time_weight=cfg.time_weight
+        refs, tgts, iterations=cfg.iterations, time_weight=cfg.time_weight,
+        manual_pairs=manual_pairs,
     )
 
     ref_matched = {a.ref.seq: a for a in anchors}
@@ -153,6 +277,7 @@ def run_alignment(refs_raw: Any, tgts_raw: Any,
                 "index": ev.seq,
                 "status": "matched",
                 "label": ev.label,
+                "source": anchor.source,
                 "original_time": ev.time,
                 "original_time_iso": to_iso(ev.time),
                 "calibrated_time": t_cal,
@@ -167,6 +292,7 @@ def run_alignment(refs_raw: Any, tgts_raw: Any,
                 "index": ev.seq,
                 "status": "inserted",
                 "label": ev.label,
+                "source": None,
                 "original_time": ev.time,
                 "original_time_iso": to_iso(ev.time),
                 "calibrated_time": t_cal,
@@ -195,6 +321,7 @@ def run_alignment(refs_raw: Any, tgts_raw: Any,
             "reference_index": a.ref.seq,
             "target_index": a.tgt.seq,
             "label": a.ref.label,
+            "source": a.source,
             "reference_time": a.ref.time,
             "target_time": a.tgt.time,
             "mapped_time": mapping.predict(a.tgt.time),
@@ -205,6 +332,7 @@ def run_alignment(refs_raw: Any, tgts_raw: Any,
     ]
 
     matched_conf = [a.confidence for a in anchors]
+    manual_count = sum(1 for a in anchors if a.source == "manual")
     aligned.sort(key=lambda r: r["index"])
     missing.sort(key=lambda r: r["index"])
 
@@ -213,6 +341,8 @@ def run_alignment(refs_raw: Any, tgts_raw: Any,
             "reference_count": len(refs),
             "target_count": len(tgts),
             "matched_count": len(anchors),
+            "manual_anchor_count": manual_count,
+            "auto_anchor_count": len(anchors) - manual_count,
             "inserted_count": len(tgts) - len(anchors),
             "missing_count": len(refs) - len(anchors),
             "mean_confidence": (sum(matched_conf) / len(matched_conf)

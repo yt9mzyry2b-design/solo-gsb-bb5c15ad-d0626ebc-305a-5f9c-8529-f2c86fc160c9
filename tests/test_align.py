@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -282,3 +284,195 @@ def test_align_unsupported_media_type():
     r = client.post("/align", content="abc",
                     headers={"content-type": "text/plain"})
     assert r.status_code == 415
+
+
+# --- manual anchors ---------------------------------------------------------
+
+
+ANCHORS = [
+    {"reference_index": 0, "target_index": 0},
+    {"reference_index": 25, "target_index": 23},
+    {"reference_index": 39, "target_index": 36},
+]
+
+
+def test_manual_anchors_locked_and_segmented():
+    refs = make_ref()
+    tgts = make_drifting_target(refs, drop_ids={5, 17, 30})
+    res = run_alignment(refs, tgts, AlignConfig(manual_anchors=ANCHORS))
+    s = res["summary"]
+
+    assert s["manual_anchor_count"] == 3
+    assert s["auto_anchor_count"] == s["matched_count"] - 3
+    assert s["matched_count"] == 37            # 40 refs - 3 drops
+    assert s["inserted_count"] == 0           # no spurious events
+
+    by_pair = {(a["reference_index"], a["target_index"]): a
+               for a in res["anchors"]}
+    for ri, ti in ANCHORS:
+        a = by_pair[(ri, ti)]
+        assert a["source"] == "manual"
+        assert a["confidence"] == 1.0
+
+    # Automatic matches never reuse a locked event or cross a lock.
+    auto = [(a["reference_index"], a["target_index"])
+            for a in res["anchors"] if a["source"] == "auto"]
+    locked_r = {ri for ri, _ in ANCHORS}
+    locked_t = {ti for _, ti in ANCHORS}
+    assert all(ri not in locked_r and ti not in locked_t for ri, ti in auto)
+    ordered_locks = sorted(ANCHORS, key=lambda x: x["reference_index"])
+    for ri, ti in auto:
+        for left, right in zip(ordered_locks, ordered_locks[1:]):
+            if left["reference_index"] < ri < right["reference_index"]:
+                assert left["target_index"] < ti < right["target_index"]
+        if ri > ordered_locks[-1]["reference_index"]:
+            assert ti > ordered_locks[-1]["target_index"]
+        if ri < ordered_locks[0]["reference_index"]:
+            assert ti < ordered_locks[0]["target_index"]
+
+    # The merged piecewise map passes through every lock.
+    for a in res["anchors"]:
+        assert a["mapped_time"] == pytest.approx(a["reference_time"], abs=2e-3)
+
+
+def test_manual_anchor_single_lock():
+    refs, tgts = make_ref(n=20), make_drifting_target(make_ref(n=20))
+    res = run_alignment(
+        refs, tgts,
+        AlignConfig(manual_anchors=[{"reference_index": 10,
+                                      "target_index": 10}]),
+    )
+    assert res["summary"]["manual_anchor_count"] == 1
+    lock = [a for a in res["anchors"] if a["source"] == "manual"]
+    assert len(lock) == 1
+    assert lock[0]["reference_index"] == 10
+    assert lock[0]["confidence"] == 1.0
+
+
+def test_manual_anchors_only():
+    refs, tgts = make_ref(n=5), make_drifting_target(make_ref(n=5))
+    res = run_alignment(refs, tgts, AlignConfig(manual_anchors=[
+        {"reference_index": i, "target_index": i} for i in range(5)
+    ]))
+    s = res["summary"]
+    assert s["matched_count"] == 5
+    assert s["auto_anchor_count"] == 0
+    assert s["inserted_count"] == 0
+    assert s["missing_count"] == 0
+    assert res["clock_mapping"]["type"] == "PiecewiseLinearMapping"
+    assert all(a["source"] == "manual" for a in res["anchors"])
+
+
+def test_manual_anchors_correct_natural_match():
+    # One target occurrence dropped: truth shifts after the gap.  Locking
+    # (ref 3, tgt 2) forces the matcher into the correct gaps.
+    refs = [{"timestamp": 100.0 + 10 * i, "label": "A"} for i in range(6)]
+    tgts = [{"timestamp": 103.0 + 10 * i, "label": "A"}
+            for i in (0, 1, 3, 4, 5)]
+    res = run_alignment(refs, tgts, AlignConfig(manual_anchors=[
+        {"reference_index": 3, "target_index": 2}]))
+    pairs = {(a["reference_index"], a["target_index"])
+             for a in res["anchors"]}
+    assert (3, 2) in pairs
+    assert (2, 2) not in pairs and (3, 3) not in pairs
+    # Strictly ordered, no crossing on either side.
+    rs = sorted(r for r, _ in pairs)
+    ts = [t for r, t in sorted(pairs)]
+    assert rs == sorted(set(rs))
+    assert ts == sorted(ts)
+
+
+def test_manual_anchors_json_body():
+    refs, tgts = make_ref(n=20), make_drifting_target(make_ref(n=20))
+    r = client.post("/align", json={
+        "reference": refs, "target": tgts,
+        "anchors": [{"reference_index": 0, "target_index": 0},
+                    {"reference_index": 19, "target_index": 19}],
+    })
+    assert r.status_code == 200
+    body = r.json()
+    assert body["summary"]["manual_anchor_count"] == 2
+    locks = [a for a in body["anchors"] if a["source"] == "manual"]
+    assert {(a["reference_index"], a["target_index"]) for a in locks} == {
+        (0, 0), (19, 19)}
+
+
+def test_manual_anchors_multipart_form():
+    refs = make_ref(n=10)
+    tgts = make_drifting_target(refs)
+    r = client.post(
+        "/align",
+        files={
+            "reference": ("reference.jsonl",
+                          "\n".join(json.dumps(x) for x in refs),
+                          "application/x-ndjson"),
+            "target": ("target.jsonl",
+                       "\n".join(json.dumps(x) for x in tgts),
+                       "application/x-ndjson"),
+        },
+        data={"anchors": json.dumps([
+            {"reference_index": 2, "target_index": 2},
+            {"reference_index": 8, "target_index": 8},
+        ])},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["summary"]["manual_anchor_count"] == 2
+    assert all(a["source"] in ("manual", "auto") for a in body["anchors"])
+
+
+@pytest.mark.parametrize("anchors, fragment", [
+    ([{"reference_index": 99, "target_index": 0}], "reference_index 99 out of range"),
+    ([{"reference_index": 0, "target_index": 99}], "target_index 99 out of range"),
+    ([{"reference_index": -1, "target_index": 0}], "reference_index"),
+    ([{"reference_index": 1, "target_index": 1},
+      {"reference_index": 2, "target_index": 1}], "already locked"),
+    ([{"reference_index": 1, "target_index": 1},
+      {"reference_index": 1, "target_index": 2}], "already locked"),
+    ([{"reference_index": 2, "target_index": 5},
+      {"reference_index": 6, "target_index": 3}], "cross"),
+    ([{"reference_index": 0}], "target_index"),
+])
+def test_manual_anchors_validation_400(anchors, fragment):
+    refs = [{"timestamp": 100.0 + 10 * i, "label": "X"} for i in range(10)]
+    tgts = [{"timestamp": 150.0 + 10 * i, "label": "X"} for i in range(10)]
+    with pytest.raises(InputError) as exc:
+        run_alignment(refs, tgts, AlignConfig(manual_anchors=anchors))
+    assert fragment in str(exc.value)
+    # Same condition through HTTP -> 400 with a locatable message.
+    r = client.post("/align", json={"reference": refs, "target": tgts,
+                                    "anchors": anchors})
+    assert r.status_code == 400
+    assert fragment in r.json()["detail"]
+
+
+def test_manual_anchor_label_mismatch_400():
+    refs = make_ref(n=10)
+    tgts = make_drifting_target(refs)
+    tgts[3] = {"timestamp": tgts[3]["timestamp"], "label": "OTHER"}
+    r = client.post("/align", json={
+        "reference": refs, "target": tgts,
+        "anchors": [{"reference_index": 3, "target_index": 3}],
+    })
+    assert r.status_code == 400
+    assert "label mismatch" in r.json()["detail"]
+    assert "anchors[0]" in r.json()["detail"]
+
+
+def test_manual_anchors_bad_json_400():
+    refs = make_ref(n=5)
+    tgts = make_drifting_target(refs)
+    r = client.post(
+        "/align",
+        files={
+            "reference": ("r.jsonl",
+                          "\n".join(json.dumps(x) for x in refs),
+                          "application/x-ndjson"),
+            "target": ("t.jsonl",
+                       "\n".join(json.dumps(x) for x in tgts),
+                       "application/x-ndjson"),
+        },
+        data={"anchors": "not-json"},
+    )
+    assert r.status_code == 400
+    assert "anchors" in r.json()["detail"]

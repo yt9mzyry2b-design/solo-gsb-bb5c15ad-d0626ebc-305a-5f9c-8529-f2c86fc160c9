@@ -23,6 +23,14 @@ Algorithm overview
    the anchor span).  Steps 1-2 are re-run with the refined map; the soft
    temporal Gaussian lets anchors migrate and the solution stabilises
    within a few iterations.
+
+4. *Manual anchors* supplied by the client are non-skippable locks.  The
+   sequences are cut at those locks into half-open gaps (before the first,
+   between consecutive pairs, after the last) and the matcher above runs
+   independently inside each gap: locked events are excluded from the
+   candidate windows, so automatic matches can neither reuse a locked
+   event nor cross a manual anchor.  All anchors are then merged and the
+   piecewise map is fit once over the union.
 """
 
 from __future__ import annotations
@@ -309,12 +317,34 @@ class _Pair:
     parent: int = -1
 
 
+def _build_label_indexes(
+    refs: Sequence[Event],
+) -> tuple[dict[str, list[Event]], dict[str, list[float]]]:
+    """Time-sorted same-label buckets, reused across gaps and iterations."""
+    ref_by_label: dict[str, list[Event]] = {}
+    for ev in refs:
+        ref_by_label.setdefault(ev.label, []).append(ev)
+    for bucket in ref_by_label.values():
+        bucket.sort(key=lambda e: e.time)
+    ref_times_by_label = {
+        label: [e.time for e in bucket]
+        for label, bucket in ref_by_label.items()
+    }
+    return ref_by_label, ref_times_by_label
+
+
 def _candidate_pairs(
     refs: Sequence[Event],
     tgts: Sequence[Event],
     mapping: Callable[[float], float],
     sigma: float,
     time_weight: float,
+    ref_lo: int = 0,
+    ref_hi: int | None = None,
+    tgt_lo: int = 0,
+    tgt_hi: int | None = None,
+    label_indexes: tuple[dict[str, list[Event]],
+                         dict[str, list[float]]] | None = None,
 ) -> list[_Pair]:
     """Build admissible same-label (ref, target) candidate pairs.
 
@@ -322,28 +352,39 @@ def _candidate_pairs(
     mapped target time are admitted; if the window is empty (large initial
     offset, or the bootstrap line straddles a clock jump), the two nearest
     same-label events are used instead.
+
+    ``ref_lo``/``ref_hi``/``tgt_lo``/``tgt_hi`` restrict both sides to the
+    half-open ``[lo, hi)`` *sequence-index* windows.  They are used to run
+    the matcher independently inside each gap between client-locked manual
+    anchors so that automatic matches can neither reuse a locked event nor
+    cross a manual anchor.
+
+    ``label_indexes`` may supply pre-built same-label reference buckets to
+    avoid rebuilding them per gap / iteration.
     """
-    ref_by_label: dict[str, list[Event]] = {}
-    for ev in refs:
-        ref_by_label.setdefault(ev.label, []).append(ev)
-    ref_times_by_label = {
-        label: [e.time for e in bucket]
-        for label, bucket in ref_by_label.items()
-    }
+    if ref_hi is None:
+        ref_hi = len(refs)
+    if tgt_hi is None:
+        tgt_hi = len(tgts)
+    if label_indexes is None:
+        ref_by_label, ref_times_by_label = _build_label_indexes(refs)
+    else:
+        ref_by_label, ref_times_by_label = label_indexes
 
     radius = WINDOW_SIGMA * sigma
     inv_two_sigma2 = 1.0 / (2.0 * max(sigma, 1e-9) ** 2)
     pairs: list[_Pair] = []
 
-    def emit(bucket: list[Event], k: int, centre: float,
-             tgt: Event) -> None:
-        residual = centre - bucket[k].time
+    def emit(ev: Event, centre: float, tgt: Event) -> None:
+        residual = centre - ev.time
         w = LABEL_BONUS + time_weight * math.exp(
             -(residual * residual) * inv_two_sigma2
         )
-        pairs.append(_Pair(j=bucket[k].seq, i=tgt.seq, w=w))
+        pairs.append(_Pair(j=ev.seq, i=tgt.seq, w=w))
 
     for tgt in tgts:
+        if not (tgt_lo <= tgt.seq < tgt_hi):
+            continue
         bucket = ref_by_label.get(tgt.label)
         if not bucket:
             continue
@@ -352,26 +393,46 @@ def _candidate_pairs(
 
         lo = bisect_left(ref_times, centre - radius)
         hi = bisect_right(ref_times, centre + radius)
-        if hi > lo:
-            candidates: Any = range(lo, hi)
-            if hi - lo > CANDIDATE_CAP:
+
+        # Keep only the candidates whose sequence position lies inside this
+        # gap (locked boundary events and other gaps are excluded).
+        kept = [
+            k for k in range(lo, hi)
+            if ref_lo <= bucket[k].seq < ref_hi
+        ]
+        if kept:
+            candidates: Any = kept
+            if len(kept) > CANDIDATE_CAP:
                 candidates = sorted(
-                    range(lo, hi),
-                    key=lambda k: abs(bucket[k].time - centre),
+                    kept, key=lambda k: abs(bucket[k].time - centre)
                 )[:CANDIDATE_CAP]
             for k in candidates:
-                emit(bucket, k, centre, tgt)
+                emit(bucket[k], centre, tgt)
         else:
-            # Outside the temporal window (e.g. the bootstrap global line
-            # straddles a clock jump).  Take the two nearest same-label
-            # events instead of the single nearest one: keeping both sides
-            # of the jump lets the DP choose, instead of permanently
-            # locking a jump-region target to the wrong reference event.
+            # Nothing in the temporal window belongs to this gap (e.g. the
+            # seed line straddles a clock jump, or the window overlaps a
+            # neighbouring gap).  Take the two nearest same-label events
+            # *inside the gap*: keeping both sides of a jump lets the DP
+            # choose instead of permanently locking the wrong event.
             ins = bisect_left(ref_times, centre)
-            if ins < len(bucket):
-                emit(bucket, ins, centre, tgt)
-            if ins > 0:
-                emit(bucket, ins - 1, centre, tgt)
+            found_hi = None
+            for k in range(ins, len(bucket)):
+                if bucket[k].seq >= ref_hi:
+                    break
+                if bucket[k].seq >= ref_lo:
+                    found_hi = k
+                    break
+            found_lo = None
+            for k in range(ins - 1, -1, -1):
+                if bucket[k].seq < ref_lo:
+                    break
+                if bucket[k].seq < ref_hi:
+                    found_lo = k
+                    break
+            if found_hi is not None:
+                emit(bucket[found_hi], centre, tgt)
+            if found_lo is not None:
+                emit(bucket[found_lo], centre, tgt)
     return pairs
 
 
@@ -381,6 +442,12 @@ def monotonic_match(
     mapping: ClockMapping,
     sigma: float,
     time_weight: float,
+    ref_lo: int = 0,
+    ref_hi: int | None = None,
+    tgt_lo: int = 0,
+    tgt_hi: int | None = None,
+    label_indexes: tuple[dict[str, list[Event]],
+                         dict[str, list[float]]] | None = None,
 ) -> list[Anchor]:
     """Maximum-weight monotonic matching via a Fenwick-tree weighted LIS.
 
@@ -389,9 +456,14 @@ def monotonic_match(
     equal target position (queries first, commits after) so each target
     event is used at most once; the prefix query enforces the same on the
     reference side.  No per-event closures are allocated in the hot loop.
+
+    The half-open ``[lo, hi)`` sequence-index windows restrict matching to a
+    single gap between locked manual anchors (see ``_candidate_pairs``).
     """
     pairs = _candidate_pairs(
-        refs, tgts, mapping.predict, sigma, time_weight
+        refs, tgts, mapping.predict, sigma, time_weight,
+        ref_lo=ref_lo, ref_hi=ref_hi, tgt_lo=tgt_lo, tgt_hi=tgt_hi,
+        label_indexes=label_indexes,
     )
     if not pairs:
         return []
@@ -499,18 +571,52 @@ def _loo_residual(anchors_sorted: Sequence[Anchor], k: int) -> float:
 # --- top-level driver -------------------------------------------------------
 
 
+def _fit_anchor_mapping(anchors: Sequence[Anchor]) -> ClockMapping:
+    """Piecewise-linear map through ``anchors`` (or constant/single anchor)."""
+    if len(anchors) >= 2:
+        return PiecewiseLinearMapping(anchors)
+    if len(anchors) == 1:
+        return ConstantMapping(
+            anchors[0].ref.time - anchors[0].tgt.time
+        )
+    return ConstantMapping(0.0)
+
+
 def align_sequences(
     refs: Sequence[Event],
     tgts: Sequence[Event],
     iterations: int = DEFAULT_ITERATIONS,
     time_weight: float = DEFAULT_TIME_WEIGHT,
+    manual_pairs: Sequence[tuple[Event, Event]] | None = None,
 ) -> tuple[list[Anchor], ClockMapping, float]:
     """Run the iterative match/fit loop.
 
     Returns ``(anchors, clock_mapping, confidence_scale_seconds)``.
     The scale is the leave-one-out residual spread of the final anchors,
     useful as a temporal unit when scoring unmatched events.
+
+    ``manual_pairs`` are client-locked ``(reference, target)`` pairs.  They
+    are validated upstream (in-range, no double occupation, same label, no
+    crossing) and are treated as mandatory anchors: the matcher is run
+    separately inside each gap between consecutive locks and can neither
+    consume a locked event nor jump over a lock.
     """
+    if not manual_pairs:
+        return _align_unconstrained(refs, tgts, iterations, time_weight)
+    return _align_constrained(
+        refs, tgts, iterations, time_weight,
+        [Anchor(ref=r, tgt=t, confidence=1.0, source="manual")
+         for r, t in manual_pairs],
+    )
+
+
+def _align_unconstrained(
+    refs: Sequence[Event],
+    tgts: Sequence[Event],
+    iterations: int,
+    time_weight: float,
+) -> tuple[list[Anchor], ClockMapping, float]:
+    """Original behaviour with no client locks."""
     mapping = bootstrap_mapping(refs, tgts)
     total_iters = max(1, iterations)
     # Bootstrap pass: only nearest same-label candidates are admitted (the
@@ -558,5 +664,134 @@ def align_sequences(
                           confidence=0.5)]
     else:
         conf_scale = 1.0
+
+    return anchors, mapping, conf_scale
+
+
+def _align_constrained(
+    refs: Sequence[Event],
+    tgts: Sequence[Event],
+    iterations: int,
+    time_weight: float,
+    manual_anchors: Sequence[Anchor],
+) -> tuple[list[Anchor], ClockMapping, float]:
+    """Match within the gaps cut by client-locked anchors, then merge.
+
+    The manual anchors have already been validated; they are ordered by
+    increasing ``reference`` index here (their target indices then increase
+    strictly as well -- the crossing check rejected any other case).
+    """
+    total_iters = max(1, iterations)
+
+    # A global line through the locks is a far better seed than a blind
+    # bootstrap whenever at least two locks exist; one lock at least fixes
+    # the offset.  The per-gap matchers still refine this with a
+    # piecewise map including the boundary anchors.
+    global_seed: ClockMapping | None = None
+    if len(manual_anchors) >= 2:
+        global_seed = LinearMapping.fit(manual_anchors)
+    elif manual_anchors:
+        m0 = manual_anchors[0]
+        global_seed = ConstantMapping(m0.ref.time - m0.tgt.time)
+
+    # seq -> Event lookup, so gap slicing stays O(events) in total.
+    ref_by_seq = sorted(refs, key=lambda e: e.seq)
+    tgt_by_seq = sorted(tgts, key=lambda e: e.seq)
+    ref_seqs = [e.seq for e in ref_by_seq]
+    tgt_seqs = [e.seq for e in tgt_by_seq]
+    # Same-label reference buckets are shared by every gap and iteration.
+    label_indexes = _build_label_indexes(refs)
+
+    cuts: list[tuple[int | None, int | None, int | None, int | None,
+                      Anchor | None, Anchor | None]] = []
+    # Each cut = (ref_lo, ref_hi, tgt_lo, tgt_hi, left_anchor, right_anchor)
+    # over half-open sequence-index windows.  Adjacent gaps share the
+    # boundary anchor (used only to fit the mapping, never re-matched).
+    prev: Anchor | None = None
+    for cur in manual_anchors:
+        r_hi = cur.ref.seq
+        i_hi = cur.tgt.seq
+        r_lo = prev.ref.seq + 1 if prev is not None else 0
+        i_lo = prev.tgt.seq + 1 if prev is not None else 0
+        cuts.append((r_lo, r_hi, i_lo, i_hi, prev, cur))
+        prev = cur
+    last = manual_anchors[-1]
+    cuts.append((
+        last.ref.seq + 1, len(refs),
+        last.tgt.seq + 1, len(tgts),
+        last, None,
+    ))
+
+    auto_anchors: list[Anchor] = []
+
+    for r_lo, r_hi, i_lo, i_hi, left, right in cuts:
+        gap_refs = ref_by_seq[
+            bisect_left(ref_seqs, r_lo):bisect_left(ref_seqs, r_hi)
+        ]
+        gap_tgts = tgt_by_seq[
+            bisect_left(tgt_seqs, i_lo):bisect_left(tgt_seqs, i_hi)
+        ]
+        if not gap_refs or not gap_tgts:
+            continue
+
+        boundary = [a for a in (left, right) if a is not None]
+
+        # Seed mapping for this gap: the global line through the locks, or
+        # a bootstrap built from the gap events plus its boundary anchors.
+        mapping: ClockMapping
+        if global_seed is not None:
+            mapping = global_seed
+        else:
+            seed_refs = [a.ref for a in boundary] + gap_refs
+            seed_tgts = [a.tgt for a in boundary] + gap_tgts
+            mapping = bootstrap_mapping(seed_refs, seed_tgts)
+
+        sigma = 1.0
+        for it in range(total_iters):
+            matched = monotonic_match(
+                refs, tgts, mapping, sigma, time_weight,
+                ref_lo=r_lo, ref_hi=r_hi, tgt_lo=i_lo, tgt_hi=i_hi,
+                label_indexes=label_indexes,
+            )
+            fit_set = boundary + matched
+            mapping = _fit_anchor_mapping(fit_set)
+
+            # Refine the temporal Gaussian (boundary locks included).
+            if it < total_iters - 1 and len(fit_set) >= 2:
+                ordered = sorted(fit_set, key=lambda a: a.ref.time)
+                loo = [_loo_residual(ordered, k)
+                       for k in range(len(ordered))]
+                sigma = max(robust_sigma(loo), 1e-3)
+
+        auto_anchors.extend(matched)
+
+    # Merge: locked anchors (confidence fixed at 1.0) plus automatic ones.
+    all_anchors: list[Anchor] = list(manual_anchors) + auto_anchors
+    ordered = sorted(all_anchors, key=lambda a: a.ref.time)
+    mapping = _fit_anchor_mapping(ordered)
+
+    # Confidence for automatic anchors from leave-one-out residuals of the
+    # merged anchor chain.  Manual locks are fixed to 1.0 -- they are
+    # ground truth by construction and must not be down-weighted by a jump.
+    auto_ordered = [a for a in ordered if a.source == "auto"]
+    if auto_ordered and len(ordered) >= 2:
+        loo_map = {
+            id(a): abs(_loo_residual(ordered, k))
+            for k, a in enumerate(ordered)
+        }
+        auto_loo = [loo_map[id(a)] for a in auto_ordered]
+        conf_scale = max(_percentile(sorted(auto_loo), 0.9), 1e-3)
+        scored: list[Anchor] = []
+        for a in ordered:
+            if a.source == "manual":
+                scored.append(a)
+            else:
+                c = math.exp(-0.5 * (loo_map[id(a)] / conf_scale) ** 2)
+                scored.append(Anchor(ref=a.ref, tgt=a.tgt, confidence=c))
+        anchors = scored
+    else:
+        # No automatic matches at all: only locks remain.
+        conf_scale = 1.0
+        anchors = ordered
 
     return anchors, mapping, conf_scale
