@@ -107,9 +107,68 @@ curl -s http://localhost:8000/align \
 | `label_field` | string          | 自动 | 标签字段名;缺省依次探测 `label/tag/event/type/name`        |
 | `iterations`  | int 1–10        | 3    | 匹配/拟合精化轮数                                 |
 | `time_weight` | float 0–2       | 0.5  | 时间一致性高斯项相对标签匹配分(1.0)的权重        |
+| `anchors`     | 数组            | 无   | 人工锚点,每项 `{"reference_index": i, "target_index": j}`,见下 |
 
 时间戳支持:数字(秒 / 毫秒 / 微秒,按量级自动判定)与 ISO-8601 字符串
 (如 `2026-09-22T08:00:00Z`)。单次请求每侧上限 50,000 条记录。
+
+### 人工锚点(`anchors`)
+
+当自动匹配在重复标签、长时间偏移或强时钟跳变处可能选错时,可用 `anchors`
+**强制指定若干必须成立的匹配对**(索引即输入数组/JSONL 的行号,从 0 开始):
+
+* 人工锚点是**不可跳过**的匹配:既不会被自动匹配覆盖,也保证出现在响应
+  `anchors` 中(`source = "manual"`,自动匹配为 `source = "auto"`);
+* 人工锚点把参考/待校准序列切分为**相邻锚点区间**,各区间独立执行原有保序
+  单调 DP,再合并拟合——因此自动匹配**不能占用已锁定事件,也不能跨越锚点**;
+* 首轮时钟映射直接由人工锚点拟合(≥2 个锚点为分段线性,1 个为常数偏移),
+  无需依赖全局自举;
+* 以下情况返回 **400**,错误信息可定位到具体锚点下标与字段:
+  索引越界、同一事件被重复占用、两侧标签不一致、两侧次序交叉
+  (按 `reference_index` 排序后 `target_index` 必须严格递增)。
+
+**JSON 请求示例:**
+
+```bash
+curl -s http://localhost:8000/align \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "reference": [
+          {"timestamp": 1790000000.0, "label": "LINE_START"},
+          {"timestamp": 1790000030.0, "label": "HEATER_ON"},
+          {"timestamp": 1790000060.0, "label": "TEMP_RAMP"}
+        ],
+        "target": [
+          {"timestamp": 1790000005.6, "label": "LINE_START"},
+          {"timestamp": 1790000036.2, "label": "HEATER_ON"},
+          {"timestamp": 1790000066.8, "label": "TEMP_RAMP"}
+        ],
+        "anchors": [
+          {"reference_index": 0, "target_index": 0},
+          {"reference_index": 2, "target_index": 2}
+        ]
+      }' | python -m json.tool
+```
+
+**multipart/form-data 请求示例:** `anchors` 可以是**一个 JSON 数组**表单字段,
+也可以为每个锚点重复提交一个 JSON 对象表单字段:
+
+```bash
+# 方式 A:一个 JSON 数组
+curl -s http://localhost:8000/align \
+  -F "reference=@examples/reference.jsonl;type=application/x-ndjson" \
+  -F "target=@examples/target.jsonl;type=application/x-ndjson" \
+  -F 'anchors=[{"reference_index":0,"target_index":0},{"reference_index":59,"target_index":59}]' \
+  | python -m json.tool
+
+# 方式 B:每个锚点一个重复的 anchors 表单字段
+curl -s http://localhost:8000/align \
+  -F "reference=@examples/reference.jsonl;type=application/x-ndjson" \
+  -F "target=@examples/target.jsonl;type=application/x-ndjson" \
+  -F 'anchors={"reference_index":0,"target_index":0}' \
+  -F 'anchors={"reference_index":59,"target_index":59}' \
+  | python -m json.tool
+```
 
 #### 响应结构
 
@@ -118,7 +177,9 @@ curl -s http://localhost:8000/align \
   "summary": {
     "reference_count": 60,
     "target_count": 61,
-    "matched_count": 59,        // 锚点数
+    "matched_count": 59,        // 锚点数(人工 + 自动)
+    "manual_anchor_count": 2,   // 人工锚点数(anchors 中 source=manual)
+    "auto_anchor_count": 57,    // 自动匹配锚点数
     "inserted_count": 2,        // 待校准侧多余(插入)事件
     "missing_count": 1,         // 参考侧缺失事件
     "mean_confidence": 0.82,    // 锚点平均置信度 [0,1]
@@ -145,7 +206,9 @@ curl -s http://localhost:8000/align \
       }
     ]
   },
-  "anchors": [ { "reference_index": 0, "target_index": 0, "label": "...",
+  "anchors": [ { "reference_index": 0, "target_index": 0,
+                 "source": "manual",        // manual = 人工锚点;auto = DP 自动匹配
+                 "label": "...",
                  "reference_time": ..., "target_time": ...,
                  "mapped_time": ..., "residual": 0.0, "confidence": 0.98 } ],
   "aligned_events": [
@@ -180,6 +243,10 @@ curl -s http://localhost:8000/align \
 
 ## 算法概要
 
+* **人工锚点**:存在人工锚点时,首轮映射直接由锚点拟合;随后每轮把两条序列按
+  锚点位置切成相邻区间,各区间分别执行下面的单调 DP(子序列上以段内秩重编号),
+  再按序合并。锁定事件不进入任何候选对,自动匹配因而既无法占用它们,也无法跨
+  越锚点边界;人工锚点始终保留在最终锚点集中并参与分段拟合与留一法置信度评分。
 * **候选对**:只有标签相同的 `(参考事件, 待校准事件)` 才能配对。每对的权重为
   `1.0 + time_weight · exp(-½(r/σ)²)`,其中 `r = 映射(t_target) - t_ref`;
   时间一致的对权重约 1.4–1.5,跳过事件得 0 分,因此插入/缺失被自然舍弃,无需
@@ -204,4 +271,6 @@ python -m pytest -q
 
 覆盖:已知分段漂移恢复、纯速率漂移、重复同标签保序匹配、标签全无交集、单锚点、
 外推标记、JSONL 文本输入、字段缺失报错以及 `/health`、`/align` 的
-JSON / multipart / 400 / 415 路径。
+JSON / multipart / 400 / 415 路径;人工锚点覆盖强制匹配与区间隔离、不跨锚点/
+不占锁定事件、越界/重复占用/标签不一致/次序交叉四类 400,以及 JSON 与
+multipart(数组字段与重复对象字段)两种提交方式。

@@ -23,6 +23,14 @@ Algorithm overview
    the anchor span).  Steps 1-2 are re-run with the refined map; the soft
    temporal Gaussian lets anchors migrate and the solution stabilises
    within a few iterations.
+
+Manual anchors
+--------------
+Client-supplied anchors are mandatory matches.  They seed the first clock
+map directly and partition both streams into intervals; the DP above runs
+per interval (see :func:`segmented_match`), so automatic matches can never
+claim a locked event or cross an anchor.  Manual anchors survive into the
+final anchor set tagged ``source="manual"``.
 """
 
 from __future__ import annotations
@@ -384,17 +392,32 @@ def monotonic_match(
 ) -> list[Anchor]:
     """Maximum-weight monotonic matching via a Fenwick-tree weighted LIS.
 
-    A single Fenwick tree keyed on the *global* reference position enforces
-    strict ordering across all labels.  Pairs are processed in batches of
-    equal target position (queries first, commits after) so each target
-    event is used at most once; the prefix query enforces the same on the
-    reference side.  No per-event closures are allocated in the hot loop.
+    A single Fenwick tree keyed on *reference rank* (position within the
+    supplied subsequence) enforces strict ordering across all labels.
+    Pairs are processed in batches of equal target rank (queries first,
+    commits after) so each target event is used at most once; the prefix
+    query enforces the same on the reference side.  No per-event closures
+    are allocated in the hot loop.
+
+    ``refs`` / ``tgts`` may be contiguous sub-slices of the global streams
+    (manual anchors split the sequences into intervals); ranks are positions
+    inside the slice while global ``seq`` values are kept on the emitted
+    anchors.
     """
     pairs = _candidate_pairs(
         refs, tgts, mapping.predict, sigma, time_weight
     )
     if not pairs:
         return []
+
+    # Global seq -> rank within the supplied subsequence.  Ordering within a
+    # stream is identical under time/seq ordering (both sides are sorted), so
+    # rank == strictly increasing seq order.
+    ref_rank = {e.seq: k for k, e in enumerate(refs)}
+    tgt_rank = {e.seq: k for k, e in enumerate(tgts)}
+    for p in pairs:
+        p.j = ref_rank[p.j]
+        p.i = tgt_rank[p.i]
 
     pairs.sort(key=lambda p: (p.i, p.j))
 
@@ -448,7 +471,8 @@ def monotonic_match(
 
         pos = end
 
-    # Backtrack.
+    # Backtrack.  After the rank remap above, p.j/p.i are positions inside
+    # the supplied refs/tgts subsequences, so they index the lists directly.
     chain: list[_Pair] = []
     cur = best_pid
     while cur != -1:
@@ -456,9 +480,7 @@ def monotonic_match(
         cur = pairs[cur].parent
     chain.reverse()
 
-    ref_by_seq = {e.seq: e for e in refs}
-    tgt_by_seq = {e.seq: e for e in tgts}
-    return [Anchor(ref=ref_by_seq[p.j], tgt=tgt_by_seq[p.i], confidence=0.0)
+    return [Anchor(ref=refs[p.j], tgt=tgts[p.i], confidence=0.0)
             for p in chain]
 
 
@@ -499,19 +521,94 @@ def _loo_residual(anchors_sorted: Sequence[Anchor], k: int) -> float:
 # --- top-level driver -------------------------------------------------------
 
 
+def _mapping_from_anchors(anchors: Sequence[Anchor]) -> ClockMapping:
+    """Piecewise map for >=2 anchors, constant offset for one, identity for none."""
+    if len(anchors) >= 2:
+        return PiecewiseLinearMapping(anchors)
+    if len(anchors) == 1:
+        return ConstantMapping(
+            anchors[0].ref.time - anchors[0].tgt.time
+        )
+    return ConstantMapping(0.0)
+
+
+def segmented_match(
+    refs: Sequence[Event],
+    tgts: Sequence[Event],
+    manual: Sequence[Anchor],
+    mapping: ClockMapping,
+    sigma: float,
+    time_weight: float,
+) -> list[Anchor]:
+    """Order-preserving DP match inside each interval between manual anchors.
+
+    Manual anchors are mandatory matches that partition both streams into
+    intervals (before the first anchor, between consecutive anchors, after
+    the last anchor).  The original :func:`monotonic_match` runs independently
+    on each interval, so automatic matches can neither occupy locked events
+    nor cross an anchor; chaining interval results in boundary order yields a
+    globally monotonic match.
+    """
+    locked_refs = {a.ref.seq for a in manual}
+    locked_tgts = {a.tgt.seq for a in manual}
+    ordered = sorted(manual, key=lambda a: a.ref.seq)
+
+    matched: list[Anchor] = []
+    prev_r = prev_t = -1
+    for a in ordered:
+        r_hi, t_hi = a.ref.seq, a.tgt.seq
+        ref_seg = [
+            e for e in refs if prev_r < e.seq < r_hi
+            and e.seq not in locked_refs
+        ]
+        tgt_seg = [
+            e for e in tgts if prev_t < e.seq < t_hi
+            and e.seq not in locked_tgts
+        ]
+        if ref_seg and tgt_seg:
+            matched.extend(
+                monotonic_match(ref_seg, tgt_seg, mapping, sigma, time_weight)
+            )
+        matched.append(a)
+        prev_r, prev_t = r_hi, t_hi
+
+    ref_seg = [e for e in refs if e.seq > prev_r and e.seq not in locked_refs]
+    tgt_seg = [e for e in tgts if e.seq > prev_t and e.seq not in locked_tgts]
+    if ref_seg and tgt_seg:
+        matched.extend(
+            monotonic_match(ref_seg, tgt_seg, mapping, sigma, time_weight)
+        )
+
+    matched.sort(key=lambda a: a.ref.seq)
+    return matched
+
+
 def align_sequences(
     refs: Sequence[Event],
     tgts: Sequence[Event],
     iterations: int = DEFAULT_ITERATIONS,
     time_weight: float = DEFAULT_TIME_WEIGHT,
+    manual_anchors: Sequence[Anchor] | None = None,
 ) -> tuple[list[Anchor], ClockMapping, float]:
     """Run the iterative match/fit loop.
+
+    ``manual_anchors`` (if given) are non-skippable matches supplied by the
+    caller.  They seed the initial clock map and split both streams into
+    intervals; automatic DP matching is confined to each interval and cannot
+    reuse a locked event or cross an anchor.  Manual anchors are always
+    present in the returned anchor set (with ``source="manual"``).
 
     Returns ``(anchors, clock_mapping, confidence_scale_seconds)``.
     The scale is the leave-one-out residual spread of the final anchors,
     useful as a temporal unit when scoring unmatched events.
     """
-    mapping = bootstrap_mapping(refs, tgts)
+    manual = sorted(manual_anchors or [], key=lambda a: a.ref.seq)
+    if manual:
+        # The mandatory matches alone determine the first clock map; no
+        # global bootstrap over the noisy full streams is needed.
+        mapping: ClockMapping = _mapping_from_anchors(manual)
+    else:
+        mapping = bootstrap_mapping(refs, tgts)
     total_iters = max(1, iterations)
     # Bootstrap pass: only nearest same-label candidates are admitted (the
     # temporal window is tight around the median offset), so it cannot
@@ -519,12 +616,17 @@ def align_sequences(
     # pass 1 then spans clock jumps and rate drift with the full ±3σ window.
     sigma = 1.0
 
-    anchors: list[Anchor] = []
+    anchors: list[Anchor] = list(manual)
 
     for it in range(total_iters):
-        anchors = monotonic_match(
-            refs, tgts, mapping, sigma, time_weight,
-        )
+        if manual:
+            anchors = segmented_match(
+                refs, tgts, manual, mapping, sigma, time_weight
+            )
+        else:
+            anchors = monotonic_match(
+                refs, tgts, mapping, sigma, time_weight,
+            )
         if len(anchors) >= 2:
             mapping = PiecewiseLinearMapping(anchors)
         elif len(anchors) == 1:
@@ -550,12 +652,13 @@ def align_sequences(
         scored: list[Anchor] = []
         for k, a in enumerate(ordered):
             c = math.exp(-0.5 * (loo[k] / conf_scale) ** 2)
-            scored.append(Anchor(ref=a.ref, tgt=a.tgt, confidence=c))
+            scored.append(Anchor(ref=a.ref, tgt=a.tgt, confidence=c,
+                                 source=a.source))
         anchors = scored
     elif len(anchors) == 1:
         conf_scale = 1.0
         anchors = [Anchor(ref=ordered[0].ref, tgt=ordered[0].tgt,
-                          confidence=0.5)]
+                          confidence=0.5, source=ordered[0].source)]
     else:
         conf_scale = 1.0
 

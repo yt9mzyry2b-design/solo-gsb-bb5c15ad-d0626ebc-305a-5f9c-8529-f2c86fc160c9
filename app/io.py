@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import json
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Sequence
 
 from .matching import ClockMapping, PiecewiseLinearMapping, align_sequences
-from .models import Event
+from .models import Anchor, Event
 from .timeutil import parse_timestamp, to_iso
 
 MAX_RECORDS = 50_000
@@ -22,11 +22,20 @@ class InputError(ValueError):
 
 
 @dataclass
+class ManualAnchorSpec:
+    """One client-supplied mandatory match (indices into the raw streams)."""
+
+    reference_index: int
+    target_index: int
+
+
+@dataclass
 class AlignConfig:
     time_field: str | None = None
     label_field: str | None = None
     iterations: int = 3
     time_weight: float = 0.5
+    manual_anchors: list[ManualAnchorSpec] = field(default_factory=list)
 
 
 # --- parsing ----------------------------------------------------------------
@@ -100,6 +109,107 @@ def parse_events(raw: Any, cfg: AlignConfig) -> list[Event]:
     return events
 
 
+# --- manual anchors ---------------------------------------------------------
+
+
+def _anchor_index(item: Any, key: str, pos: int) -> int:
+    if key not in item:
+        raise InputError(f"anchors[{pos}]: missing field {key!r}")
+    value = item[key]
+    # bool is a subclass of int -- reject it explicitly.
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise InputError(
+            f"anchors[{pos}].{key}: expected a non-negative integer index, "
+            f"got {value!r}"
+        )
+    if value < 0:
+        raise InputError(
+            f"anchors[{pos}].{key}: index must be non-negative, got {value}"
+        )
+    return value
+
+
+def validate_manual_anchors(
+    specs: Sequence[ManualAnchorSpec],
+    refs: Sequence[Event],
+    tgts: Sequence[Event],
+) -> list[Anchor]:
+    """Validate client anchors against the parsed streams and lock the pairs.
+
+    Checks, with a locatable message for every failure:
+
+    * indices inside both stream bounds;
+    * no reference / target event claimed by more than one anchor;
+    * the two events of a pair carry the same label;
+    * pairs are order-consistent across the two sides (no crossing).
+
+    Returns anchors tagged ``source="manual"``, ordered by reference index.
+    """
+    ref_by_seq = {e.seq: e for e in refs}
+    tgt_by_seq = {e.seq: e for e in tgts}
+
+    anchors: list[Anchor] = []
+    used_ref: set[int] = set()
+    used_tgt: set[int] = set()
+
+    for pos, spec in enumerate(specs):
+        r_idx, t_idx = spec.reference_index, spec.target_index
+
+        if r_idx >= len(ref_by_seq):
+            raise InputError(
+                f"anchors[{pos}].reference_index: index {r_idx} out of bounds "
+                f"(reference has {len(ref_by_seq)} events)"
+            )
+        if t_idx >= len(tgt_by_seq):
+            raise InputError(
+                f"anchors[{pos}].target_index: index {t_idx} out of bounds "
+                f"(target has {len(tgt_by_seq)} events)"
+            )
+        if r_idx in used_ref:
+            other = next(
+                k for k, a in enumerate(anchors) if a.ref.seq == r_idx
+            )
+            raise InputError(
+                f"anchors[{pos}].reference_index: reference event {r_idx} is "
+                f"already locked by anchors[{other}]"
+            )
+        if t_idx in used_tgt:
+            other = next(
+                k for k, a in enumerate(anchors) if a.tgt.seq == t_idx
+            )
+            raise InputError(
+                f"anchors[{pos}].target_index: target event {t_idx} is "
+                f"already locked by anchors[{other}]"
+            )
+
+        ref_ev = ref_by_seq[r_idx]
+        tgt_ev = tgt_by_seq[t_idx]
+        if ref_ev.label != tgt_ev.label:
+            raise InputError(
+                f"anchors[{pos}]: label mismatch -- reference[{r_idx}] label "
+                f"{ref_ev.label!r} vs target[{t_idx}] label {tgt_ev.label!r}"
+            )
+
+        used_ref.add(r_idx)
+        used_tgt.add(t_idx)
+        anchors.append(Anchor(ref=ref_ev, tgt=tgt_ev, confidence=0.0,
+                              source="manual"))
+
+    # Order crossing: sorted by reference index, target indices must be
+    # strictly increasing as well.
+    by_ref = sorted(anchors, key=lambda a: a.ref.seq)
+    for k in range(1, len(by_ref)):
+        prev, cur = by_ref[k - 1], by_ref[k]
+        if cur.tgt.seq < prev.tgt.seq:
+            raise InputError(
+                "anchors: order crossing between "
+                f"(reference_index={prev.ref.seq}, target_index={prev.tgt.seq}) "
+                f"and (reference_index={cur.ref.seq}, target_index={cur.tgt.seq})"
+            )
+
+    return by_ref
+
+
 # --- result assembly --------------------------------------------------------
 
 
@@ -136,9 +246,13 @@ def run_alignment(refs_raw: Any, tgts_raw: Any,
     if not refs and not tgts:
         raise InputError("both reference and target streams are empty")
 
+    manual = validate_manual_anchors(cfg.manual_anchors, refs, tgts)
+
     anchors, mapping, residual_scale = align_sequences(
-        refs, tgts, iterations=cfg.iterations, time_weight=cfg.time_weight
+        refs, tgts, iterations=cfg.iterations, time_weight=cfg.time_weight,
+        manual_anchors=manual,
     )
+    manual_count = sum(1 for a in anchors if a.source == "manual")
 
     ref_matched = {a.ref.seq: a for a in anchors}
     tgt_matched = {a.tgt.seq: a for a in anchors}
@@ -194,6 +308,7 @@ def run_alignment(refs_raw: Any, tgts_raw: Any,
         {
             "reference_index": a.ref.seq,
             "target_index": a.tgt.seq,
+            "source": a.source,
             "label": a.ref.label,
             "reference_time": a.ref.time,
             "target_time": a.tgt.time,
@@ -213,6 +328,8 @@ def run_alignment(refs_raw: Any, tgts_raw: Any,
             "reference_count": len(refs),
             "target_count": len(tgts),
             "matched_count": len(anchors),
+            "manual_anchor_count": manual_count,
+            "auto_anchor_count": len(anchors) - manual_count,
             "inserted_count": len(tgts) - len(anchors),
             "missing_count": len(refs) - len(anchors),
             "mean_confidence": (sum(matched_conf) / len(matched_conf)
